@@ -25,3 +25,4 @@ target
 *.sst
 wal.log
 MANIFEST
+.trae/*
