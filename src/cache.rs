@@ -124,7 +124,9 @@ impl BlockCache {
             // SAFETY: ptr was produced by Box::into_raw and is owned by this
             // cache (invariant 1). move_to_front only adjusts list pointers
             // (invariant 2) — it never frees the node.
-            unsafe { self.move_to_front(ptr); }
+            unsafe {
+                self.move_to_front(ptr);
+            }
             self.hits += 1;
             // SAFETY: ptr is valid for the entire lifetime of &mut self.
             // The node cannot be dropped while this cache is alive.
@@ -169,7 +171,9 @@ impl BlockCache {
             // SAFETY: raw came from Box::into_raw with null prev/next,
             // satisfying push_front's precondition. We record it in the map
             // immediately after, satisfying invariant 1.
-            unsafe { self.push_front(raw); }
+            unsafe {
+                self.push_front(raw);
+            }
             self.map.insert(key, raw);
             self.size_bytes += new_len;
         }
@@ -183,7 +187,9 @@ impl BlockCache {
             let lru_key = unsafe { (*lru).key.clone() };
             let lru_len = unsafe { (*lru).value.len() };
             // SAFETY: lru is a valid non-null node in this list.
-            unsafe { self.unlink(lru); }
+            unsafe {
+                self.unlink(lru);
+            }
             self.map.remove(&lru_key);
             self.size_bytes -= lru_len;
             // SAFETY: lru is now fully unlinked and removed from the map;

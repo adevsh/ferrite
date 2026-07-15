@@ -42,10 +42,17 @@ fn test_basic_insert_and_get() {
     cache.insert(key("/b.sst", 0), block(0x03, 16));
 
     assert_eq!(cache.get(&key("/a.sst", 0)).cloned(), Some(block(0x01, 4)));
-    assert_eq!(cache.get(&key("/a.sst", 100)).cloned(), Some(block(0x02, 8)));
+    assert_eq!(
+        cache.get(&key("/a.sst", 100)).cloned(),
+        Some(block(0x02, 8))
+    );
     assert_eq!(cache.get(&key("/b.sst", 0)).cloned(), Some(block(0x03, 16)));
 
-    assert_eq!(cache.hit_count(), 3, "every get on a present key must be a hit");
+    assert_eq!(
+        cache.hit_count(),
+        3,
+        "every get on a present key must be a hit"
+    );
     assert_eq!(cache.miss_count(), 0, "no misses when all keys are present");
     assert_eq!(cache.size_bytes(), 4 + 8 + 16);
     assert_eq!(cache.len(), 3);
@@ -62,7 +69,7 @@ fn test_basic_insert_and_get() {
 fn test_capacity_eviction_lru_order() {
     let mut cache = BlockCache::new(30);
 
-    cache.insert(key("/s.sst", 0), block(1, 10));   // k1 — tail after k2/k3 inserted
+    cache.insert(key("/s.sst", 0), block(1, 10)); // k1 — tail after k2/k3 inserted
     cache.insert(key("/s.sst", 100), block(2, 10)); // k2
     cache.insert(key("/s.sst", 200), block(3, 10)); // k3 — head
 
@@ -73,7 +80,11 @@ fn test_capacity_eviction_lru_order() {
     assert_eq!(cache.len(), 3);
     assert_eq!(cache.size_bytes(), 30);
 
-    assert_eq!(cache.get(&key("/s.sst", 0)), None, "k1 must have been evicted");
+    assert_eq!(
+        cache.get(&key("/s.sst", 0)),
+        None,
+        "k1 must have been evicted"
+    );
     assert!(cache.get(&key("/s.sst", 100)).is_some(), "k2 must survive");
     assert!(cache.get(&key("/s.sst", 200)).is_some(), "k3 must survive");
     assert!(cache.get(&key("/s.sst", 300)).is_some(), "k4 must survive");
@@ -89,7 +100,7 @@ fn test_capacity_eviction_lru_order() {
 fn test_access_pattern_promotes_node() {
     let mut cache = BlockCache::new(30);
 
-    cache.insert(key("/p.sst", 0), block(1, 10));   // k1
+    cache.insert(key("/p.sst", 0), block(1, 10)); // k1
     cache.insert(key("/p.sst", 100), block(2, 10)); // k2
     cache.insert(key("/p.sst", 200), block(3, 10)); // k3
 
@@ -101,7 +112,10 @@ fn test_access_pattern_promotes_node() {
 
     assert_eq!(cache.len(), 3);
     assert_eq!(cache.get(&key("/p.sst", 100)), None, "k2 must be evicted");
-    assert!(cache.get(&key("/p.sst", 0)).is_some(), "k1 must survive (promoted)");
+    assert!(
+        cache.get(&key("/p.sst", 0)).is_some(),
+        "k1 must survive (promoted)"
+    );
     assert!(cache.get(&key("/p.sst", 200)).is_some(), "k3 must survive");
     assert!(cache.get(&key("/p.sst", 300)).is_some(), "k4 must survive");
 }
@@ -118,8 +132,16 @@ fn test_insert_overwrite_updates_value_and_size() {
     assert_eq!(cache.len(), 1);
 
     cache.insert(key("/o.sst", 0), vec![0xBB; 5]);
-    assert_eq!(cache.size_bytes(), 5, "size_bytes must reflect the new value length");
-    assert_eq!(cache.len(), 1, "overwrite must not create a duplicate entry");
+    assert_eq!(
+        cache.size_bytes(),
+        5,
+        "size_bytes must reflect the new value length"
+    );
+    assert_eq!(
+        cache.len(),
+        1,
+        "overwrite must not create a duplicate entry"
+    );
     assert_eq!(
         cache.get(&key("/o.sst", 0)).cloned(),
         Some(vec![0xBB; 5]),
@@ -145,7 +167,11 @@ fn test_invalidate_removes_only_matching_path() {
     cache.invalidate(&path_a);
 
     assert_eq!(cache.len(), 2, "only path_b entries must remain");
-    assert_eq!(cache.size_bytes(), 40, "size_bytes must reflect only path_b blocks");
+    assert_eq!(
+        cache.size_bytes(),
+        40,
+        "size_bytes must reflect only path_b blocks"
+    );
 
     assert_eq!(cache.get(&(path_a.clone(), 0)), None);
     assert_eq!(cache.get(&(path_a.clone(), 100)), None);

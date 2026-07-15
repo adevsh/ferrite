@@ -115,10 +115,7 @@ impl SSTableWriter {
     /// Returns `FerriteError::Io` if the parent directory does not exist or
     /// the file cannot be created.
     pub fn new(path: &Path) -> Result<SSTableWriter> {
-        let file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(path)?;
+        let file = OpenOptions::new().create_new(true).write(true).open(path)?;
         Ok(SSTableWriter {
             file,
             path: path.to_path_buf(),
@@ -402,7 +399,11 @@ impl SSTableReader {
             let blk_end = index_offset;
             let blk_bytes = read_exact_at(&file, blk_start, (blk_end - blk_start) as usize)?;
             let entries = parse_block_entries(&blk_bytes, blk_start)?;
-            entries.into_iter().last().map(|(k, _)| k).unwrap_or_default()
+            entries
+                .into_iter()
+                .last()
+                .map(|(k, _)| k)
+                .unwrap_or_default()
         };
 
         Ok(SSTableReader {
@@ -443,9 +444,7 @@ impl SSTableReader {
         }
 
         // Binary search: rightmost block whose first_key <= key.
-        let pp = self
-            .index
-            .partition_point(|(fk, _)| fk.as_slice() <= key);
+        let pp = self.index.partition_point(|(fk, _)| fk.as_slice() <= key);
         if pp == 0 {
             // Key is smaller than the first block's first key.
             return Ok(None);
@@ -499,9 +498,7 @@ impl SSTableReader {
             return Ok(None);
         }
 
-        let pp = self
-            .index
-            .partition_point(|(fk, _)| fk.as_slice() <= key);
+        let pp = self.index.partition_point(|(fk, _)| fk.as_slice() <= key);
         if pp == 0 {
             return Ok(None);
         }
@@ -520,8 +517,7 @@ impl SSTableReader {
         let block_bytes: Vec<u8> = match cache.get(&cache_key).cloned() {
             Some(b) => b,
             None => {
-                let bytes =
-                    read_exact_at(&self.file, blk_start, (blk_end - blk_start) as usize)?;
+                let bytes = read_exact_at(&self.file, blk_start, (blk_end - blk_start) as usize)?;
                 cache.insert(cache_key, bytes.clone());
                 bytes
             }
@@ -569,8 +565,7 @@ impl SSTableReader {
             } else {
                 self.index_offset
             };
-            let blk_bytes =
-                read_exact_at(&self.file, blk_start, (blk_end - blk_start) as usize)?;
+            let blk_bytes = read_exact_at(&self.file, blk_start, (blk_end - blk_start) as usize)?;
             let entries = parse_block_entries(&blk_bytes, blk_start)?;
 
             let mut done = false;
@@ -671,14 +666,11 @@ impl<'a> Iterator for SSTableIter<'a> {
             };
             self.block_idx += 1;
 
-            let blk_bytes = match read_exact_at(
-                &self.reader.file,
-                blk_start,
-                (blk_end - blk_start) as usize,
-            ) {
-                Ok(b) => b,
-                Err(e) => return Some(Err(e)),
-            };
+            let blk_bytes =
+                match read_exact_at(&self.reader.file, blk_start, (blk_end - blk_start) as usize) {
+                    Ok(b) => b,
+                    Err(e) => return Some(Err(e)),
+                };
 
             match parse_block_entries(&blk_bytes, blk_start) {
                 Ok(entries) => {
@@ -719,10 +711,7 @@ fn read_exact_at(file: &File, offset: u64, len: usize) -> Result<Vec<u8>> {
 /// so callers can distinguish data corruption from ordinary API errors.
 ///
 /// `block_offset` is included in error messages only.
-fn parse_block_entries(
-    block: &[u8],
-    block_offset: u64,
-) -> Result<BlockEntries> {
+fn parse_block_entries(block: &[u8], block_offset: u64) -> Result<BlockEntries> {
     if block.len() < DATA_BLOCK_HEADER_SIZE {
         return Err(FerriteError::InvalidFormat(format!(
             "data block at {block_offset} is only {} bytes (need at least {DATA_BLOCK_HEADER_SIZE})",

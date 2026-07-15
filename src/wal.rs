@@ -77,10 +77,7 @@ impl Wal {
     pub fn open(dir: &Path) -> Result<Wal> {
         std::fs::create_dir_all(dir)?;
         let path = dir.join(WAL_FILENAME);
-        let file = OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(&path)?;
+        let file = OpenOptions::new().append(true).create(true).open(&path)?;
         Ok(Wal { file, path })
     }
 
@@ -116,17 +113,45 @@ impl Wal {
     /// # Errors
     /// Returns `FerriteError::Io` if any file operation or fsync fails.
     pub fn truncate(&mut self) -> Result<()> {
+        self.rewrite(Vec::new())
+    }
+
+    /// Replaces the WAL contents with `records`, atomically.
+    ///
+    /// Writes a full replacement log to `wal.log.tmp`, fsyncs it, renames it
+    /// over `wal.log`, then reopens the append handle. This lets the Engine
+    /// drop flushed records while retaining any still-live Memtable state
+    /// without exposing a partially rewritten WAL after a failed rewrite.
+    ///
+    /// # Errors
+    /// Returns `FerriteError::Io` if any file operation, write, or fsync fails.
+    pub fn rewrite(&mut self, records: Vec<WalRecord>) -> Result<()> {
+        let tmp_path = self.path.with_extension("log.tmp");
         {
-            let f = std::fs::File::create(&self.path)?;
-            // Fsync the zero-length state before releasing this handle so the
-            // empty file is durable even if the process crashes before the
-            // next WAL write.
-            f.sync_all()?;
+            let mut tmp = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+
+            for record in records {
+                match record {
+                    WalRecord::Put { key, value } => {
+                        tmp.write_all(&Self::encode_record(TYPE_PUT, &key, &value))?;
+                    }
+                    WalRecord::Delete { key } => {
+                        tmp.write_all(&Self::encode_record(TYPE_DELETE, &key, &[]))?;
+                    }
+                }
+            }
+
+            tmp.sync_all()?;
         }
-        // Reopen in append mode; the old handle is dropped (closed) as part
-        // of the assignment.
+
+        std::fs::rename(&tmp_path, &self.path)?;
         self.file = OpenOptions::new()
             .append(true)
+            .create(true)
             .open(&self.path)?;
         Ok(())
     }
@@ -170,10 +195,8 @@ impl Wal {
             // These unwraps are safe: we already verified remaining >= 13.
             let stored_crc = decode_u32(&buf[pos..pos + 4]).expect("4 bytes available");
             let record_type = buf[pos + 4];
-            let key_len =
-                decode_u32(&buf[pos + 5..pos + 9]).expect("4 bytes available") as usize;
-            let val_len =
-                decode_u32(&buf[pos + 9..pos + 13]).expect("4 bytes available") as usize;
+            let key_len = decode_u32(&buf[pos + 5..pos + 9]).expect("4 bytes available") as usize;
+            let val_len = decode_u32(&buf[pos + 9..pos + 13]).expect("4 bytes available") as usize;
 
             // Full record: 4 (CRC) + 1 (type) + 4 (key_len) + 4 (val_len) + key + value.
             let record_len = 13 + key_len + val_len;
@@ -220,6 +243,16 @@ impl Wal {
     /// # Errors
     /// Returns `FerriteError::Io` if `write_all` or `sync_data` fails.
     fn append_record(&mut self, record_type: u8, key: &[u8], value: &[u8]) -> Result<()> {
+        let record = Self::encode_record(record_type, key, value);
+        self.file.write_all(&record)?;
+        // sync_data flushes file contents without waiting for directory metadata;
+        // safe here because the WAL only ever appends — we never rename or relink.
+        self.file.sync_data()?;
+        Ok(())
+    }
+
+    /// Encodes one WAL record into its on-disk byte layout.
+    fn encode_record(record_type: u8, key: &[u8], value: &[u8]) -> Vec<u8> {
         // Body = type byte followed by the length-prefixed key/value payload.
         let mut body = Vec::with_capacity(1 + 8 + key.len() + value.len());
         body.push(record_type);
@@ -230,11 +263,6 @@ impl Wal {
         let mut record = Vec::with_capacity(4 + body.len());
         record.extend_from_slice(&encode_u32(crc));
         record.extend_from_slice(&body);
-
-        self.file.write_all(&record)?;
-        // sync_data flushes file contents without waiting for directory metadata;
-        // safe here because the WAL only ever appends — we never rename or relink.
-        self.file.sync_data()?;
-        Ok(())
+        record
     }
 }

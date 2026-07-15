@@ -84,7 +84,11 @@ fn test_get_missing_key_bloom_short_circuits() {
     // Query 100 keys that were never inserted.
     for i in 0u32..100 {
         let key = format!("miss{i:04}").into_bytes();
-        assert_eq!(reader.get(&key).unwrap(), None, "missing key must return None");
+        assert_eq!(
+            reader.get(&key).unwrap(),
+            None,
+            "missing key must return None"
+        );
     }
 
     // At 1% FPR and 100 queries, expected ~99 bloom misses. Require ≥ 90.
@@ -152,10 +156,7 @@ fn test_tombstone_get_returns_some_none() {
 
     let reader = SSTableReader::open(&path).unwrap();
     // Live keys round-trip normally.
-    assert_eq!(
-        reader.get(b"alpha").unwrap(),
-        Some(Some(b"live".to_vec()))
-    );
+    assert_eq!(reader.get(b"alpha").unwrap(), Some(Some(b"live".to_vec())));
     assert_eq!(
         reader.get(b"omega").unwrap(),
         Some(Some(b"also-live".to_vec()))
@@ -195,7 +196,12 @@ fn test_scan_prefix_filters_and_sorts() {
     let results = reader.scan_prefix(b"user:").unwrap();
 
     // Only non-tombstone user: keys must be returned.
-    assert_eq!(results.len(), 3, "expected 3 live user: results, got {:?}", results);
+    assert_eq!(
+        results.len(),
+        3,
+        "expected 3 live user: results, got {:?}",
+        results
+    );
     assert_eq!(results[0].0, b"user:alice");
     assert_eq!(results[0].1, b"ua");
     assert_eq!(results[1].0, b"user:carol");
@@ -266,9 +272,9 @@ fn test_iter_yields_all_in_order_including_tombstones() {
 
     let input: Vec<(Vec<u8>, Option<Vec<u8>>)> = vec![
         (b"a".to_vec(), Some(b"1".to_vec())),
-        (b"b".to_vec(), None),                    // tombstone
+        (b"b".to_vec(), None), // tombstone
         (b"c".to_vec(), Some(b"3".to_vec())),
-        (b"d".to_vec(), None),                    // tombstone
+        (b"d".to_vec(), None), // tombstone
         (b"e".to_vec(), Some(b"5".to_vec())),
     ];
 
@@ -282,7 +288,10 @@ fn test_iter_yields_all_in_order_including_tombstones() {
         .collect();
 
     assert_eq!(output.len(), 5);
-    assert_eq!(output, input, "iter must yield entries in original write order");
+    assert_eq!(
+        output, input,
+        "iter must yield entries in original write order"
+    );
 }
 
 /// Writes known entries and verifies that the SSTableMeta returned by write()

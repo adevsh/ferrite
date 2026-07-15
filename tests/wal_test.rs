@@ -123,13 +123,15 @@ fn test_tail_corruption_is_dropped() {
     std::fs::write(&wal_path, &bytes).unwrap();
 
     let records = Wal::recover(dir.path()).unwrap();
-    assert_eq!(records.len(), 4, "corrupt tail record must be silently dropped");
+    assert_eq!(
+        records.len(),
+        4,
+        "corrupt tail record must be silently dropped"
+    );
     // Verify the 4 surviving records are intact.
     for (i, record) in records.iter().enumerate() {
-        assert!(
-            matches!(record, WalRecord::Put { key, value }
-                if key == &[b'k', i as u8] && value == &[b'v', i as u8])
-        );
+        assert!(matches!(record, WalRecord::Put { key, value }
+                if key == &[b'k', i as u8] && value == &[b'v', i as u8]));
     }
 }
 
@@ -157,8 +159,6 @@ fn test_truncate_resets_to_empty() {
 
     let records = Wal::recover(dir.path()).unwrap();
     assert_eq!(records.len(), 1);
-    assert!(
-        matches!(&records[0], WalRecord::Put { key, value }
-            if key == b"after" && value == b"truncate")
-    );
+    assert!(matches!(&records[0], WalRecord::Put { key, value }
+            if key == b"after" && value == b"truncate"));
 }

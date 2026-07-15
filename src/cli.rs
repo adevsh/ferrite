@@ -20,7 +20,10 @@ use clap::{Parser, Subcommand};
 
 /// Top-level CLI arguments for the Ferrite embedded key-value store.
 #[derive(Debug, Parser)]
-#[command(name = "ferrite", about = "A production-grade LSM-tree key-value store")]
+#[command(
+    name = "ferrite",
+    about = "A production-grade LSM-tree key-value store"
+)]
 pub struct Cli {
     /// Directory used to store WAL, SSTable, and MANIFEST files.
     #[arg(long, default_value = "./data")]

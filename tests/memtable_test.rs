@@ -172,12 +172,12 @@ fn test_is_full_threshold_boundary() {
     for i in 0u8..4 {
         mem.put(vec![b'k', i], vec![b'v', i]);
     }
-    assert!(!mem.is_full(threshold), "16 bytes must be below threshold 20");
+    assert!(
+        !mem.is_full(threshold),
+        "16 bytes must be below threshold 20"
+    );
 
     // 5th put adds 4 more bytes → 20 >= 20 → full.
     mem.put(vec![b'k', 4], vec![b'v', 4]);
-    assert!(
-        mem.is_full(threshold),
-        "20 bytes must satisfy threshold 20"
-    );
+    assert!(mem.is_full(threshold), "20 bytes must satisfy threshold 20");
 }

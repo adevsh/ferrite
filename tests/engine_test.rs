@@ -19,8 +19,25 @@
 //!   directly in `tests/`.
 
 use ferrite::engine::{Engine, EngineConfig, EngineStats};
-use ferrite::error::Result;
+use ferrite::error::{FerriteError, Result};
+use ferrite::wal::{Wal, WalRecord};
+use std::thread;
+use std::time::Duration;
 use tempfile::tempdir;
+
+/// Polls engine operations until any in-flight background flush is observed as
+/// complete, or panics if completion never arrives.
+fn wait_for_background_flush(engine: &mut Engine) -> Result<()> {
+    for _ in 0..1_000 {
+        if !engine.stats().flush_in_flight {
+            return Ok(());
+        }
+        let _ = engine.get(b"__flush_poll__")?;
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    panic!("background flush did not complete after polling")
+}
 
 /// Opens an engine, puts five distinct key-value pairs, and verifies each
 /// can be read back before any flush occurs.
@@ -88,7 +105,11 @@ fn test_delete_tombstone_before_and_after_flush() -> Result<()> {
     assert_eq!(engine.get(b"mykey")?, Some(b"myval".to_vec()));
 
     engine.delete(b"mykey")?;
-    assert_eq!(engine.get(b"mykey")?, None, "tombstone must shadow immediately");
+    assert_eq!(
+        engine.get(b"mykey")?,
+        None,
+        "tombstone must shadow immediately"
+    );
 
     // Flush forces both the tombstone (now in Memtable) and an older value
     // (also in Memtable from the put above) into the same L0 SSTable entry.
@@ -115,6 +136,143 @@ fn test_overwrite_after_flush_returns_newest() -> Result<()> {
         Some(b"v2".to_vec()),
         "Memtable must shadow older SSTable value",
     );
+    Ok(())
+}
+
+/// Flushes an older value to L0, then forces a threshold crossing so a newer
+/// value lives in the frozen Memtable while a different key remains in the
+/// active Memtable. Verifies reads and scans consult active first, then frozen,
+/// before falling through to SSTables.
+#[test]
+fn test_reads_and_scans_consult_active_and_frozen_memtables() -> Result<()> {
+    let dir = tempdir()?;
+    let mut config = EngineConfig::new(dir.path());
+    config.memtable_threshold = 10;
+    let mut engine = Engine::open(config)?;
+
+    // Older value persisted to L0.
+    engine.put(b"k0", b"v")?;
+    engine.flush()?;
+
+    // Newer value for k0 rotates into the frozen Memtable; k1 stays active.
+    engine.put(b"k0", b"12345678")?;
+    engine.put(b"k1", b"v1")?;
+
+    assert_eq!(
+        engine.levels()[0].len(),
+        1,
+        "threshold crossing must rotate into a frozen Memtable instead of immediately flushing"
+    );
+    assert_eq!(
+        engine.get(b"k0")?,
+        Some(b"12345678".to_vec()),
+        "frozen Memtable must shadow the older SSTable value"
+    );
+    assert_eq!(
+        engine.get(b"k1")?,
+        Some(b"v1".to_vec()),
+        "active Memtable must remain readable while a frozen Memtable exists"
+    );
+
+    let results = engine.scan_prefix(b"k")?;
+    assert_eq!(
+        results,
+        vec![
+            (b"k0".to_vec(), b"12345678".to_vec()),
+            (b"k1".to_vec(), b"v1".to_vec()),
+        ]
+    );
+    Ok(())
+}
+
+/// Forces a threshold crossing that starts a background flush, then verifies
+/// stats expose the in-flight state and a later write remains admissible while
+/// the frozen Memtable is still the newest copy for reads.
+#[test]
+fn test_stats_expose_flush_in_flight_and_later_writes_continue() -> Result<()> {
+    let dir = tempdir()?;
+    let mut config = EngineConfig::new(dir.path());
+    config.memtable_threshold = 8;
+    let mut engine = Engine::open(config)?;
+
+    engine.put(b"k0", b"v0")?;
+    engine.flush()?;
+
+    engine.put(b"k0", b"12345678")?;
+
+    let stats = engine.stats();
+    assert!(stats.has_pending_flush, "frozen Memtable should be pending");
+    assert!(stats.flush_in_flight, "background flush should be tracked");
+    assert!(
+        stats.frozen_memtable_size_bytes > 0,
+        "frozen Memtable bytes should remain visible while flush is in flight"
+    );
+    assert_eq!(
+        engine.levels()[0].len(),
+        1,
+        "completed background output is not published until completion is polled"
+    );
+
+    engine.put(b"k1", b"v1")?;
+    assert_eq!(engine.get(b"k0")?, Some(b"12345678".to_vec()));
+    assert_eq!(engine.get(b"k1")?, Some(b"v1".to_vec()));
+    Ok(())
+}
+
+/// Verifies that once a background flush completes and is observed by a later
+/// engine operation, the WAL is rewritten to contain only still-live Memtable
+/// state rather than the already-flushed frozen image.
+#[test]
+fn test_background_flush_completion_rewrites_wal_to_live_memtable_state() -> Result<()> {
+    let dir = tempdir()?;
+    let mut config = EngineConfig::new(dir.path());
+    config.memtable_threshold = 8;
+    let mut engine = Engine::open(config)?;
+
+    engine.put(b"k0", b"12345678")?;
+    engine.put(b"k1", b"v1")?;
+
+    wait_for_background_flush(&mut engine)?;
+
+    let recovered = Wal::recover(dir.path())?;
+    assert_eq!(
+        recovered,
+        vec![WalRecord::Put {
+            key: b"k1".to_vec(),
+            value: b"v1".to_vec(),
+        }],
+        "WAL should retain only the active Memtable after frozen flush completion"
+    );
+    assert_eq!(engine.get(b"k0")?, Some(b"12345678".to_vec()));
+    assert_eq!(engine.get(b"k1")?, Some(b"v1".to_vec()));
+    Ok(())
+}
+
+/// Pre-creates the next L0 filename so the background worker cannot create its
+/// SSTable. The next engine operation must observe and return that flush error.
+#[test]
+fn test_background_flush_failure_propagates_to_next_engine_operation() -> Result<()> {
+    let dir = tempdir()?;
+
+    let mut config = EngineConfig::new(dir.path());
+    config.memtable_threshold = 1;
+    let mut engine = Engine::open(config)?;
+    std::fs::write(dir.path().join("L0_00000001.sst"), b"occupied")?;
+
+    engine.put(b"k0", b"v0")?;
+
+    let err = engine
+        .get(b"k0")
+        .expect_err("next operation should surface flush failure");
+    match err {
+        FerriteError::Io(io_err) => {
+            assert!(
+                io_err.to_string().contains("exists"),
+                "expected create_new collision, got: {io_err}"
+            );
+        }
+        other => panic!("expected io error from background flush failure, got {other:?}"),
+    }
     Ok(())
 }
 
@@ -275,12 +433,15 @@ fn test_stats_reflects_memtable_size() -> Result<()> {
         stats.memtable_size_bytes > 0,
         "memtable size must be positive after inserts; got 0"
     );
+    assert_eq!(stats.frozen_memtable_size_bytes, 0);
+    assert!(!stats.has_pending_flush);
+    assert!(!stats.flush_in_flight);
     Ok(())
 }
 
 /// Verifies that `Engine::stats()` counts SSTables per level correctly.
-/// After 4 auto-flushed puts compact L0 into one L1 file, the stats must
-/// reflect L0 = 0 and L1 = 1.
+/// After 4 auto-flushed puts, leveled compaction rewrites one oldest
+/// overlapping L0 slice into L1, so the stats must reflect L0 = 3 and L1 = 1.
 #[test]
 fn test_stats_counts_sstables_per_level() -> Result<()> {
     let dir = tempdir()?;
@@ -290,9 +451,22 @@ fn test_stats_counts_sstables_per_level() -> Result<()> {
     let mut engine = Engine::open(config)?;
 
     // 4 puts → 4 flushes → on the 4th, L0 reaches threshold and auto-compacts
-    // into one L1 SSTable. After this: L0 = 0, L1 = 1.
+    // one oldest overlapping L0 slice into one L1 SSTable. After this:
+    // L0 = 3, L1 = 1.
     for i in 0u32..4 {
         engine.put(format!("k{i}").as_bytes(), format!("v{i}").as_bytes())?;
+    }
+    wait_for_background_flush(&mut engine)?;
+
+    for _ in 0..1_000 {
+        let stats = engine.stats();
+        if stats.sstable_count_per_level.first().copied().unwrap_or(0) == 3
+            && stats.sstable_count_per_level.get(1).copied().unwrap_or(0) == 1
+        {
+            break;
+        }
+        let _ = engine.get(b"__compaction_poll__")?;
+        thread::sleep(Duration::from_millis(1));
     }
 
     let stats = engine.stats();
@@ -306,14 +480,13 @@ fn test_stats_counts_sstables_per_level() -> Result<()> {
         "stats L0 count must match engine.levels()[0].len()"
     );
     assert_eq!(
-        stats.sstable_count_per_level[0],
-        0,
-        "L0 must be empty after auto-compaction"
+        stats.sstable_count_per_level[0], 3,
+        "L0 must retain 3 SSTables after leveled auto-compaction rewrites one slice"
     );
     assert_eq!(
         stats.sstable_count_per_level.get(1).copied().unwrap_or(0),
         1,
-        "L1 must have exactly 1 merged SSTable"
+        "L1 must have exactly 1 rewritten SSTable"
     );
     Ok(())
 }

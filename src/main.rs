@@ -71,17 +71,40 @@ fn main() -> error::Result<()> {
 
 /// Prints the engine stats snapshot to stdout in a human-readable format.
 ///
-/// Lines cover: current memtable footprint, per-level SSTable file counts,
-/// and the block cache hit/miss ratio. If no SSTables exist yet a single
-/// placeholder line is emitted so the output is never empty.
+/// Lines cover: active versus frozen Memtable footprint, background flush
+/// state, per-level SSTable file counts, and the block cache hit/miss ratio.
+/// If no SSTables exist yet a single placeholder line is emitted so the
+/// output is never empty.
 fn print_stats(stats: &EngineStats) {
-    println!("Memtable size:  {} bytes", stats.memtable_size_bytes);
+    let active_memtable_size_bytes = stats
+        .memtable_size_bytes
+        .saturating_sub(stats.frozen_memtable_size_bytes);
+
+    println!("Active memtable: {} bytes", active_memtable_size_bytes);
+    println!(
+        "Frozen memtable: {} bytes",
+        stats.frozen_memtable_size_bytes
+    );
+    println!("Total memtable:  {} bytes", stats.memtable_size_bytes);
+    println!(
+        "Flush pending:   {}",
+        if stats.has_pending_flush { "yes" } else { "no" }
+    );
+    println!(
+        "Flush in flight: {}",
+        if stats.flush_in_flight { "yes" } else { "no" }
+    );
     if stats.sstable_count_per_level.is_empty() {
         println!("Levels:         (no SSTables on disk)");
     } else {
         for (i, count) in stats.sstable_count_per_level.iter().enumerate() {
             let noun = if *count == 1 { "SSTable" } else { "SSTables" };
-            println!("Level {i}:        {count} {noun}");
+            let layout = if i == 0 {
+                "overlapping flush output"
+            } else {
+                "non-overlapping"
+            };
+            println!("Level {i}:        {count} {noun} ({layout})");
         }
     }
     let total = stats.cache_hit_count + stats.cache_miss_count;

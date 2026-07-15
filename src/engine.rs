@@ -5,12 +5,15 @@
 //!
 //! ## Role in the LSM pipeline
 //! The Engine is the public-facing storage API. Every write goes WAL-first
-//! (durability) then into the Memtable (fast reads); when the Memtable reaches
-//! its threshold, `flush` drains it into a Level-0 SSTable and truncates the
-//! WAL. Reads probe the Memtable first, then walk Level-0 SSTables
+//! (durability) then into the active Memtable (fast reads); when the active
+//! Memtable reaches its threshold, the Engine rotates it into a frozen state
+//! and continues writing into a fresh active Memtable. `flush` persists the
+//! frozen Memtable first, then the active Memtable, and truncates the WAL only
+//! after all in-memory state has reached SSTables. Reads probe the active
+//! Memtable, then the frozen Memtable, then walk Level-0 SSTables
 //! newest-to-oldest, using bloom-filter short-circuiting and the block cache
 //! to minimise disk I/O. On `open`, the Engine replays the WAL into a fresh
-//! Memtable and scans the data directory to rebuild the in-memory SSTable
+//! active Memtable and scans the data directory to rebuild the in-memory SSTable
 //! index so no durably written data is lost.
 //!
 //! ## Dependencies
@@ -28,13 +31,14 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::thread::{self, JoinHandle};
 
 use crate::cache::BlockCache;
-use crate::compaction::Compactor;
-use crate::error::Result;
-use crate::memtable::{Memtable, MemValue, DEFAULT_MEMTABLE_THRESHOLD};
+use crate::compaction::{Compactor, COMPACTION_THRESHOLD};
+use crate::error::{FerriteError, Result};
+use crate::memtable::{MemValue, Memtable, DEFAULT_MEMTABLE_THRESHOLD};
 use crate::sstable::{SSTableReader, SSTableWriter};
-use crate::wal::Wal;
+use crate::wal::{Wal, WalRecord};
 
 /// File extension for all SSTable files written by this engine.
 const SSTABLE_EXT: &str = "sst";
@@ -102,8 +106,11 @@ impl EngineConfig {
 /// The engine is single-threaded, so readings are stable within
 /// a single call.
 pub struct EngineStats {
-    /// Current Memtable footprint in bytes (monotonic; tombstones are counted).
+    /// Current in-memory Memtable footprint in bytes across both the active
+    /// Memtable and any frozen Memtable (monotonic; tombstones are counted).
     pub memtable_size_bytes: usize,
+    /// Current frozen Memtable footprint in bytes.
+    pub frozen_memtable_size_bytes: usize,
     /// Number of SSTable files at each level.
     /// `sstable_count_per_level[i]` is the count of files in level `i`.
     /// Empty if no SSTables have been flushed yet.
@@ -114,6 +121,19 @@ pub struct EngineStats {
     /// Total `BlockCache::get` calls that returned `None` since this `Engine`
     /// was opened.
     pub cache_miss_count: u64,
+    /// Whether a frozen Memtable is waiting to be flushed.
+    pub has_pending_flush: bool,
+    /// Whether a background flush worker is currently responsible for the
+    /// frozen Memtable's SSTable write.
+    pub flush_in_flight: bool,
+}
+
+/// Background SSTable write launched after the active Memtable rotates.
+struct BackgroundFlush {
+    /// Path where the frozen Memtable image is being written.
+    output_path: PathBuf,
+    /// Worker thread that persists the frozen image to disk.
+    handle: JoinHandle<Result<()>>,
 }
 
 // --- Engine ------------------------------------------------------------------
@@ -133,8 +153,14 @@ pub struct Engine {
     config: EngineConfig,
     /// Append-only durability log; fsynced before every Memtable mutation.
     wal: Wal,
-    /// In-memory sorted write buffer; the first read target on every `get`.
-    memtable: Memtable,
+    /// In-memory sorted write buffer that accepts all new writes.
+    active_memtable: Memtable,
+    /// Previous full Memtable held stable for a later flush while writes
+    /// continue in `active_memtable`.
+    frozen_memtable: Option<Memtable>,
+    /// Background worker currently persisting `frozen_memtable` to a new L0
+    /// SSTable. Completion is polled at the start of engine operations.
+    background_flush: Option<BackgroundFlush>,
     /// SSTable readers grouped by level. `levels[i]` is sorted by sequence
     /// number ascending; `.iter().rev()` yields newest-first within a level.
     levels: Vec<Vec<SSTableReader>>,
@@ -167,12 +193,24 @@ impl Engine {
     /// Returns a point-in-time snapshot of engine internal counters and
     /// structure for display by the `stats` CLI subcommand.
     pub fn stats(&self) -> EngineStats {
+        let frozen_memtable_size_bytes = self
+            .frozen_memtable
+            .as_ref()
+            .map_or(0, Memtable::size_bytes);
         EngineStats {
-            memtable_size_bytes: self.memtable.size_bytes(),
+            memtable_size_bytes: self.active_memtable.size_bytes() + frozen_memtable_size_bytes,
+            frozen_memtable_size_bytes,
             sstable_count_per_level: self.levels.iter().map(|l| l.len()).collect(),
             cache_hit_count: self.cache.hit_count(),
             cache_miss_count: self.cache.miss_count(),
+            has_pending_flush: self.frozen_memtable.is_some(),
+            flush_in_flight: self.background_flush.is_some(),
         }
+    }
+
+    /// Returns whether a frozen Memtable is currently waiting to be flushed.
+    pub fn has_frozen_memtable(&self) -> bool {
+        self.frozen_memtable.is_some()
     }
 
     /// Opens or creates an Engine rooted at `config.data_dir`.
@@ -201,19 +239,27 @@ impl Engine {
         // Recover WAL before opening it for append so the replay sees the
         // complete on-disk state rather than starting from the append cursor.
         let wal_records = Wal::recover(&config.data_dir)?;
-        let memtable = Memtable::restore_from_wal(wal_records);
+        let active_memtable = Memtable::restore_from_wal(wal_records);
         let wal = Wal::open(&config.data_dir)?;
 
         // Scan the directory for SSTable files. Unrecognised names (wal.log,
         // future MANIFEST, temp files) are silently ignored via
         // parse_sstable_filename returning None.
-        let mut sstable_infos: Vec<(u32, u64, PathBuf)> = Vec::new();
+        let mut sstable_infos: Vec<(u32, u64, SSTableReader)> = Vec::new();
         for entry in std::fs::read_dir(&config.data_dir)? {
             let entry = entry?;
             let file_name = entry.file_name();
             let name_str = file_name.to_string_lossy();
             if let Some((level, seq)) = parse_sstable_filename(&name_str) {
-                sstable_infos.push((level, seq, entry.path()));
+                match SSTableReader::open(&entry.path()) {
+                    Ok(reader) => sstable_infos.push((level, seq, reader)),
+                    // Background flush failures or crashes can leave behind a
+                    // reserved `.sst` filename with incomplete bytes. Skip any
+                    // unreadable candidate so startup rebuilds only published
+                    // SSTables and does not advance `next_seq` past junk.
+                    Err(FerriteError::InvalidFormat(_)) | Err(FerriteError::Corruption(_)) => {}
+                    Err(err) => return Err(err),
+                }
             }
         }
 
@@ -234,8 +280,7 @@ impl Engine {
         sstable_infos.sort_by_key(|(level, seq, _)| (*level, *seq));
 
         let mut levels: Vec<Vec<SSTableReader>> = Vec::new();
-        for (level, _seq, path) in sstable_infos {
-            let reader = SSTableReader::open(&path)?;
+        for (level, _seq, reader) in sstable_infos {
             let level_idx = level as usize;
             while levels.len() <= level_idx {
                 levels.push(Vec::new());
@@ -248,52 +293,59 @@ impl Engine {
         Ok(Engine {
             config,
             wal,
-            memtable,
+            active_memtable,
+            frozen_memtable: None,
+            background_flush: None,
             levels,
             cache,
             next_seq,
         })
     }
 
-    /// Appends `key`=`value` to the WAL, inserts into the Memtable, and
-    /// flushes to a new Level-0 SSTable if the Memtable threshold is reached.
+    /// Appends `key`=`value` to the WAL, inserts into the active Memtable, and
+    /// rotates the full active Memtable into a frozen state once the threshold
+    /// is reached.
     ///
     /// WAL is fsynced before the Memtable is mutated so the write survives
     /// a crash between the two operations.
     ///
+    /// If a frozen Memtable is already present when the active Memtable fills,
+    /// the write path first persists the older frozen Memtable so the single
+    /// frozen slot can be reused. Task 2 replaces that synchronous fallback
+    /// with real background flush coordination.
+    ///
     /// # Errors
-    /// Returns `FerriteError::Io` if the WAL write or an auto-flush fails.
+    /// Returns `FerriteError::Io` if the WAL write or any required flush fails.
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.poll_background_flush_completion()?;
         self.wal.append_put(key, value)?;
-        self.memtable.put(key.to_vec(), value.to_vec());
-        if self.memtable.is_full(self.config.memtable_threshold) {
-            self.flush()?;
-        }
+        self.active_memtable.put(key.to_vec(), value.to_vec());
+        self.rotate_or_flush_if_needed()?;
         Ok(())
     }
 
-    /// Appends a tombstone for `key` to the WAL, inserts into the Memtable,
-    /// and flushes if the Memtable threshold is reached.
+    /// Appends a tombstone for `key` to the WAL, inserts into the active
+    /// Memtable, and rotates once the Memtable threshold is reached.
     ///
     /// A Memtable tombstone shadows any older value for `key` in lower-level
     /// SSTables (LSM invariant 3). The tombstone persists in Level-0 SSTables
     /// until compaction reaches the bottom level.
     ///
     /// # Errors
-    /// Returns `FerriteError::Io` if the WAL write or an auto-flush fails.
+    /// Returns `FerriteError::Io` if the WAL write or any required flush fails.
     pub fn delete(&mut self, key: &[u8]) -> Result<()> {
+        self.poll_background_flush_completion()?;
         self.wal.append_delete(key)?;
-        self.memtable.delete(key.to_vec());
-        if self.memtable.is_full(self.config.memtable_threshold) {
-            self.flush()?;
-        }
+        self.active_memtable.delete(key.to_vec());
+        self.rotate_or_flush_if_needed()?;
         Ok(())
     }
 
     /// Returns the most recent value for `key`, or `None` if the key is
     /// absent or has been deleted.
     ///
-    /// Search order: Memtable → Level-0 SSTables newest-to-oldest → Level-1 → …
+    /// Search order: active Memtable → frozen Memtable → Level-0 SSTables
+    /// newest-to-oldest → Level-1 → …
     /// A tombstone anywhere in the search path returns `Ok(None)` immediately
     /// without probing lower layers (LSM invariant 3).
     ///
@@ -305,10 +357,14 @@ impl Engine {
     /// Returns `FerriteError::Corruption` or `FerriteError::Io` if a data
     /// block read or CRC check fails.
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        match self.memtable.get(key) {
-            Some(MemValue::Value(v)) => return Ok(Some(v.clone())),
-            Some(MemValue::Tombstone) => return Ok(None),
-            None => {}
+        self.poll_background_flush_completion()?;
+        if let Some(result) = Self::lookup_memtable(&self.active_memtable, key) {
+            return Ok(result);
+        }
+        if let Some(frozen_memtable) = &self.frozen_memtable {
+            if let Some(result) = Self::lookup_memtable(frozen_memtable, key) {
+                return Ok(result);
+            }
         }
 
         for level in &self.levels {
@@ -329,8 +385,10 @@ impl Engine {
     /// semantics.
     ///
     /// Tombstones from any layer suppress older values for the same key.
-    /// The Memtable always wins over SSTable values; within SSTables, Level-0
-    /// newest wins over older Level-0, which wins over Level-1, and so on.
+    /// The active Memtable always wins over the frozen Memtable and SSTable
+    /// values; the frozen Memtable wins over SSTables; within SSTables,
+    /// Level-0 newest wins over older Level-0, which wins over Level-1, and
+    /// so on.
     ///
     /// Uses `SSTableReader::iter()` for the cross-SSTable scan — O(N)
     /// per table — because implementing a cache-aware prefix scan would add
@@ -340,16 +398,29 @@ impl Engine {
     /// Returns `FerriteError::Corruption` or `FerriteError::Io` if a data
     /// block read fails.
     pub fn scan_prefix(&mut self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.poll_background_flush_completion()?;
         let mut acc: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
 
-        // Memtable is unconditionally newest; insert all matching entries
-        // before visiting SSTables so that or_insert below cannot overwrite them.
-        for (k, v) in self.memtable.scan_prefix(prefix) {
+        // Active Memtable is unconditionally newest; insert its matching
+        // entries first so later layers cannot overwrite them.
+        for (k, v) in self.active_memtable.scan_prefix(prefix) {
             let val_opt = match v {
                 MemValue::Value(b) => Some(b.clone()),
                 MemValue::Tombstone => None,
             };
             acc.insert(k.clone(), val_opt);
+        }
+
+        // Frozen Memtable is older than the active Memtable but newer than any
+        // SSTable. Preserve active entries already present in `acc`.
+        if let Some(frozen_memtable) = &self.frozen_memtable {
+            for (k, v) in frozen_memtable.scan_prefix(prefix) {
+                let val_opt = match v {
+                    MemValue::Value(b) => Some(b.clone()),
+                    MemValue::Tombstone => None,
+                };
+                acc.entry(k.clone()).or_insert(val_opt);
+            }
         }
 
         // SSTables visited newest-to-oldest; or_insert preserves the first
@@ -396,6 +467,7 @@ impl Engine {
     /// Returns `FerriteError::Io` or `FerriteError::Corruption` if any
     /// SSTable write, block read, or disk operation fails.
     pub fn compact(&mut self) -> Result<usize> {
+        self.finish_background_flush()?;
         let merged = Compactor::run(
             &mut self.levels,
             &self.config.data_dir,
@@ -406,41 +478,96 @@ impl Engine {
         Ok(merged)
     }
 
-    /// Drains the Memtable into a new Level-0 SSTable and truncates the WAL.
+    /// Drains the frozen Memtable first, then the active Memtable, into new
+    /// Level-0 SSTables and truncates the WAL.
     ///
-    /// No-op when the Memtable is empty (nothing to write). Otherwise:
-    /// 1. Serialises all Memtable entries into `L0_{seq:08}.sst`.
-    /// 2. Opens the written file as an `SSTableReader` and appends it to
+    /// No-op when both Memtables are empty. Otherwise:
+    /// 1. Serialises all frozen Memtable entries, if present, into
+    ///    `L0_{seq:08}.sst`.
+    /// 2. Serialises all active Memtable entries, if present, into the next
+    ///    `L0_{seq:08}.sst`.
+    /// 3. Opens each written file as an `SSTableReader` and appends it to
     ///    `self.levels[0]`.
-    /// 3. Truncates the WAL — only **after** the SSTable is fsync'd (LSM
-    ///    invariant 2: "Memtable flush truncates WAL after SSTable fsync").
-    /// 4. Resets the Memtable to empty.
-    /// 5. Runs `Compactor::run` to cascade-compact any over-threshold level.
-    /// 6. Writes MANIFEST to persist the updated `next_seq`.
+    /// 4. Truncates the WAL — only **after** every in-memory Memtable has
+    ///    reached SSTables. This keeps WAL cleanup conservative until Task 2
+    ///    introduces per-flush WAL coordination.
+    /// 5. Resets both Memtables to empty.
+    /// 6. Runs `Compactor::run` to cascade-compact any over-threshold level.
+    /// 7. Writes MANIFEST to persist the updated `next_seq`.
     ///
-    /// The entries are collected into a `Vec` before writing so that the
-    /// borrow on `self.memtable` ends before we push the new reader into
-    /// `self.levels` and then replace `self.memtable`.
+    /// The entries are collected into a `Vec` before writing so that borrows
+    /// on the Memtables end before the Engine mutates `self.levels`.
     ///
     /// # Errors
     /// Returns `FerriteError::Io` if the SSTable write, fsync, or WAL
     /// truncation fails.
     pub fn flush(&mut self) -> Result<()> {
-        if self.memtable.size_bytes() == 0 {
+        self.finish_background_flush()?;
+
+        if self.frozen_memtable.is_none() && self.active_memtable.size_bytes() == 0 {
             return Ok(());
         }
 
-        let seq = self.next_seq;
-        self.next_seq += 1;
+        if self.frozen_memtable.is_some() {
+            self.flush_frozen_memtable_sync()?;
+        }
 
-        // FLUSH_FILENAME_WIDTH = 8, matching the :08 format specifier.
-        let filename = format!("L0_{seq:0>width$}.{SSTABLE_EXT}", width = FLUSH_FILENAME_WIDTH);
-        let path = self.config.data_dir.join(filename);
+        if self.active_memtable.size_bytes() > 0 {
+            self.rotate_active_memtable_to_frozen();
+            self.flush_frozen_memtable_sync()?;
+        }
 
-        // Collect into a Vec to end the borrow on self.memtable before we
-        // mutate self.levels and then replace self.memtable below.
-        let entries: Vec<(Vec<u8>, Option<Vec<u8>>)> = self
-            .memtable
+        Ok(())
+    }
+
+    /// Returns the current value for `key` from `memtable`, if present.
+    fn lookup_memtable(memtable: &Memtable, key: &[u8]) -> Option<Option<Vec<u8>>> {
+        match memtable.get(key) {
+            Some(MemValue::Value(v)) => Some(Some(v.clone())),
+            Some(MemValue::Tombstone) => Some(None),
+            None => None,
+        }
+    }
+
+    /// Rotates the active Memtable into the frozen slot on the first threshold
+    /// crossing. If a frozen Memtable is already waiting, persist that older
+    /// Memtable first so the slot can be reused.
+    fn rotate_or_flush_if_needed(&mut self) -> Result<()> {
+        if !self.active_memtable.is_full(self.config.memtable_threshold) {
+            return Ok(());
+        }
+
+        if self.frozen_memtable.is_some() {
+            self.finish_background_flush()?;
+        }
+        if self.frozen_memtable.is_some() {
+            self.flush_frozen_memtable_sync()?;
+        }
+        self.rotate_active_memtable_to_frozen();
+        self.start_background_flush();
+        self.poll_background_flush_completion()?;
+        if self.background_flush.is_some()
+            && self.levels.first().map_or(0, Vec::len) + 1 >= COMPACTION_THRESHOLD
+        {
+            self.finish_background_flush()?;
+        }
+
+        Ok(())
+    }
+
+    /// Moves the active Memtable into the frozen slot and replaces it with a
+    /// fresh active Memtable.
+    fn rotate_active_memtable_to_frozen(&mut self) {
+        if self.active_memtable.size_bytes() == 0 || self.frozen_memtable.is_some() {
+            return;
+        }
+        self.frozen_memtable = Some(std::mem::take(&mut self.active_memtable));
+    }
+
+    /// Collects all Memtable entries into the `(key, value-or-tombstone)`
+    /// form expected by `SSTableWriter`.
+    fn collect_memtable_entries(memtable: &Memtable) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+        memtable
             .iter()
             .map(|(k, v)| {
                 (
@@ -451,25 +578,97 @@ impl Engine {
                     },
                 )
             })
-            .collect();
+            .collect()
+    }
 
-        SSTableWriter::new(&path)?.write(entries.into_iter())?;
+    /// Persists the current frozen Memtable into a new Level-0 SSTable on the
+    /// caller thread, then runs the same completion path used by the
+    /// background worker.
+    fn flush_frozen_memtable_sync(&mut self) -> Result<()> {
+        let Some(frozen_memtable) = self.frozen_memtable.as_ref() else {
+            return Ok(());
+        };
 
-        let reader = SSTableReader::open(&path)?;
+        let entries = Self::collect_memtable_entries(frozen_memtable);
+        if entries.is_empty() {
+            self.rewrite_wal_from_live_memtables(false)?;
+            self.frozen_memtable = None;
+            write_manifest(&self.config.data_dir, self.next_seq)?;
+            return Ok(());
+        }
+
+        let path = self.reserve_next_l0_path();
+        Self::write_sstable_file(&path, entries)?;
+        self.complete_frozen_flush(path)
+    }
+
+    /// Launches a background worker that writes the current frozen Memtable to
+    /// its reserved Level-0 SSTable path.
+    fn start_background_flush(&mut self) {
+        if self.background_flush.is_some() {
+            return;
+        }
+
+        let Some(frozen_memtable) = self.frozen_memtable.as_ref() else {
+            return;
+        };
+        let entries = Self::collect_memtable_entries(frozen_memtable);
+        if entries.is_empty() {
+            return;
+        }
+
+        let output_path = self.reserve_next_l0_path();
+        let worker_path = output_path.clone();
+        let handle = thread::spawn(move || Self::write_sstable_file(&worker_path, entries));
+        self.background_flush = Some(BackgroundFlush {
+            output_path,
+            handle,
+        });
+    }
+
+    /// Completes a finished background flush if its worker has already exited.
+    fn poll_background_flush_completion(&mut self) -> Result<()> {
+        let Some(background_flush) = self.background_flush.as_ref() else {
+            return Ok(());
+        };
+        for _ in 0..64 {
+            if background_flush.handle.is_finished() {
+                return self.finish_background_flush();
+            }
+            thread::yield_now();
+        }
+        Ok(())
+    }
+
+    /// Waits for any in-flight background flush to finish and integrates its
+    /// completed SSTable into the engine state.
+    fn finish_background_flush(&mut self) -> Result<()> {
+        let Some(background_flush) = self.background_flush.take() else {
+            return Ok(());
+        };
+
+        match background_flush.handle.join() {
+            Ok(Ok(())) => self.complete_frozen_flush(background_flush.output_path),
+            Ok(Err(err)) => Err(err),
+            Err(panic_payload) => Err(FerriteError::Io(std::io::Error::other(format!(
+                "background flush thread panicked: {}",
+                join_panic_message(&panic_payload)
+            )))),
+        }
+    }
+
+    /// Finalizes a flushed frozen Memtable by cleaning up the WAL, publishing
+    /// the new SSTable into L0, and running post-flush compaction.
+    fn complete_frozen_flush(&mut self, output_path: PathBuf) -> Result<()> {
+        let reader = SSTableReader::open(&output_path)?;
+        self.rewrite_wal_from_live_memtables(false)?;
+
         if self.levels.is_empty() {
             self.levels.push(Vec::new());
         }
         self.levels[0].push(reader);
+        self.frozen_memtable = None;
 
-        // LSM invariant 2: WAL truncate after SSTable fsync.
-        self.wal.truncate()?;
-
-        self.memtable = Memtable::new();
-
-        // Cascade-compact any level that is now over the threshold, then
-        // persist next_seq so MANIFEST reflects both the flush and any
-        // compaction outputs emitted by the cascade.
-        // The merge count is discarded here — auto-flush is not user-driven.
         let _ = Compactor::run(
             &mut self.levels,
             &self.config.data_dir,
@@ -477,12 +676,75 @@ impl Engine {
             &mut self.next_seq,
         )?;
         write_manifest(&self.config.data_dir, self.next_seq)?;
-
         Ok(())
+    }
+
+    /// Rewrites the WAL to contain only Memtable state that is still resident
+    /// in memory after a flush completes.
+    fn rewrite_wal_from_live_memtables(&mut self, include_frozen: bool) -> Result<()> {
+        let mut records = Vec::new();
+
+        if include_frozen {
+            if let Some(frozen_memtable) = &self.frozen_memtable {
+                records.extend(Self::collect_wal_records(frozen_memtable));
+            }
+        }
+        records.extend(Self::collect_wal_records(&self.active_memtable));
+
+        self.wal.rewrite(records)
+    }
+
+    /// Collects the current Memtable image as WAL records in key order.
+    fn collect_wal_records(memtable: &Memtable) -> Vec<WalRecord> {
+        memtable
+            .iter()
+            .map(|(key, value)| match value {
+                MemValue::Value(bytes) => WalRecord::Put {
+                    key: key.clone(),
+                    value: bytes.clone(),
+                },
+                MemValue::Tombstone => WalRecord::Delete { key: key.clone() },
+            })
+            .collect()
+    }
+
+    /// Reserves the next Level-0 SSTable output path and advances `next_seq`.
+    fn reserve_next_l0_path(&mut self) -> PathBuf {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+
+        let filename = format!(
+            "L0_{seq:0>width$}.{SSTABLE_EXT}",
+            width = FLUSH_FILENAME_WIDTH
+        );
+        self.config.data_dir.join(filename)
+    }
+
+    /// Writes one Memtable image to `path`, removing any partial output if the
+    /// SSTable write fails mid-stream.
+    fn write_sstable_file(path: &Path, entries: Vec<(Vec<u8>, Option<Vec<u8>>)>) -> Result<()> {
+        match SSTableWriter::new(path)?.write(entries.into_iter()) {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                let _ = std::fs::remove_file(path);
+                Err(err)
+            }
+        }
     }
 }
 
 // --- private helpers ---------------------------------------------------------
+
+/// Formats a thread panic payload into a short string for error reporting.
+fn join_panic_message(payload: &(dyn std::any::Any + Send + 'static)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
 
 /// Atomically writes `next_seq` to the MANIFEST file.
 ///

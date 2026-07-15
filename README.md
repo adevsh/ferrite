@@ -4,7 +4,7 @@ A production-grade embedded key-value store built entirely from scratch in Rust,
 
 ## What it is
 
-Ferrite is a durable, persistent key-value store backed by a Log-Structured Merge-tree (LSM-tree). Writes land in a durable Write-Ahead Log and an in-memory sorted Memtable. When the Memtable crosses a size threshold it is flushed to an immutable Sorted String Table (SSTable) on disk. SSTables accumulate at level 0 and are merged by a size-tiered compaction cascade. Reads check the Memtable first, then level 0, then deeper levels; a per-SSTable Bloom filter and an in-memory LRU block cache keep most reads fast.
+Ferrite is a durable, persistent key-value store backed by a Log-Structured Merge-tree (LSM-tree). Writes land in a durable Write-Ahead Log and an in-memory sorted Memtable. When the active Memtable crosses a size threshold it is rotated into a frozen Memtable and flushed to an immutable Sorted String Table (SSTable) on disk in the background while writes continue in a fresh active Memtable. SSTables land in overlapping level 0 and are compacted into non-overlapping L1+ levels with a leveled compaction policy. Reads check the active Memtable first, then the frozen Memtable, then level 0, then deeper levels; a per-SSTable Bloom filter and an in-memory LRU block cache keep most reads fast.
 
 ## Why it exists
 
@@ -21,14 +21,16 @@ Write path
   WAL (wal.log)         <- fsynced before Memtable insert
        |
        v
-  Memtable              <- BTreeMap<key, Value|Tombstone>
+  Active Memtable       <- BTreeMap<key, Value|Tombstone>
        |  (threshold crossed)
        v
-  SSTableWriter         <- [DataBlocks | IndexBlock | BloomBytes | Footer]
-       |                   appended to levels[0]
+  Frozen Memtable       <- remains readable while flush runs
        v
-  Compactor             <- size-tiered cascade: >=4 files -> merge to next level
-       |                   tombstones GC'd only at the bottom level
+  Background flush      <- writes new L0 SSTable without blocking later puts
+       |
+       v
+  Compactor             <- leveled rewrite: L0 overlaps, L1+ stay non-overlapping
+       |                   tombstones GC'd only when no deeper overlap remains
        v
   MANIFEST              <- atomic rename; tracks next sequence number
 
@@ -36,13 +38,15 @@ Read path
 ---------
   get(key)
        |
-       +-- 1. Memtable (exact match, O(log n))
+       +-- 1. Active Memtable (exact match, O(log n))
        |
-       +-- 2. levels[0] newest -> oldest
+       +-- 2. Frozen Memtable
+       |
+       +-- 3. levels[0] newest -> oldest
        |        +-- Bloom filter: skip if absent
        |        +-- binary-search index -> BlockCache (LRU) -> pread
        |
-       +-- 3. levels[1], levels[2], ... (same pattern)
+       +-- 4. levels[1], levels[2], ... (non-overlapping by key range)
 ```
 
 ## Build
@@ -73,7 +77,7 @@ All commands accept a `--data-dir <path>` flag (default: `./data`).
 | `delete`   | `ferrite delete <key>`         | `DELETED`                                 |
 | `scan`     | `ferrite scan <prefix>`        | `key | value` per matching key            |
 | `compact`  | `ferrite compact`              | `Compaction complete. N files merged.`    |
-| `stats`    | `ferrite stats`                | memtable size, SSTable counts, cache ratio|
+| `stats`    | `ferrite stats`                | active/frozen memtable bytes, flush state, per-level SSTable counts, cache ratio |
 | `bench`    | `ferrite bench <count>`        | write ops/sec, read ops/sec, total time   |
 
 ### Example session
@@ -140,8 +144,8 @@ src/
   memtable.rs    -- in-memory sorted buffer (BTreeMap, Value/Tombstone)
   sstable.rs     -- SSTableWriter (single-use) + SSTableReader (pread)
   cache.rs       -- LRU BlockCache (unsafe doubly-linked list)
-  compaction.rs  -- size-tiered Compactor (cascade, bottom-level tombstone GC)
-  engine.rs      -- LSM Engine coordinator (open/put/get/delete/flush/compact)
+  compaction.rs  -- leveled Compactor (overlap selection, non-overlapping L1+)
+  engine.rs      -- LSM Engine coordinator (active/frozen Memtables, flush/compact)
   cli.rs         -- clap CLI definition (Cli, Command)
   lib.rs         -- library crate root (re-exports for integration tests)
   main.rs        -- binary entry point (command dispatch + bench helper)
@@ -152,7 +156,7 @@ tests/
   bloom_test.rs        -- Bloom filter (5 tests)
   sstable_test.rs      -- SSTableWriter + Reader (9 tests)
   cache_test.rs        -- BlockCache LRU (8 tests)
-  compaction_test.rs   -- size-tiered compaction (10 tests)
+  compaction_test.rs   -- leveled compaction (10 tests)
   engine_test.rs       -- Engine integration (10 tests)
 ```
 
@@ -160,18 +164,17 @@ tests/
 
 ## Future work
 
-The engine is currently **single-threaded**. Possible next steps, roughly ordered by effort:
+The foreground API is still **single-threaded**, although Memtable flush now runs on a background worker. Possible next steps, roughly ordered by effort:
 
 1. **Concurrent reads** — replace `BlockCache::get(&mut self)` with clock-style eviction (`&self`), allowing `Engine::get` to take `&self` and enabling `Arc<RwLock<Engine>>` or a sharded read path.
-2. **Non-blocking flush** — hold an immutable "frozen" Memtable for reads while flushing in a background thread, so writes never stall.
-3. **WAL group commit** — batch multiple puts under one `fsync` to amortise the per-write APFS latency (~10x write throughput improvement).
-4. **Leveled compaction** — non-overlapping L1+ levels with a fixed size multiplier; reduces read amplification for scan-heavy workloads.
-5. **Block-level compression** — LZ4 or Snappy on data blocks before CRC; halves typical disk footprint.
-6. **Prefix bloom filters** — short-circuit `scan_prefix` the same way point gets are short-circuited today.
-7. **Snapshots / MVCC** — sequence-number-tagged keys and snapshot handles for consistent reads under concurrent writes.
-8. **Range deletes** — a single `[start, end)` tombstone for bulk deletes.
-9. **Async I/O** — `io_uring` or Tokio for the read path (useful once the engine is multi-threaded).
-10. **Bench enhancements** — p50/p99 latency histograms, cold-cache vs warm-cache phases, configurable key/value sizes.
+2. **WAL group commit** — batch multiple puts under one `fsync` to amortise the per-write APFS latency (~10x write throughput improvement).
+3. **Level sizing policy** — add per-level byte budgets and fanout targets on top of the current overlap-based leveled rewrites.
+4. **Block-level compression** — LZ4 or Snappy on data blocks before CRC; halves typical disk footprint.
+5. **Prefix bloom filters** — short-circuit `scan_prefix` the same way point gets are short-circuited today.
+6. **Snapshots / MVCC** — sequence-number-tagged keys and snapshot handles for consistent reads under concurrent writes.
+7. **Range deletes** — a single `[start, end)` tombstone for bulk deletes.
+8. **Async I/O** — `io_uring` or Tokio for the read path (useful once the engine is multi-threaded).
+9. **Bench enhancements** — p50/p99 latency histograms, cold-cache vs warm-cache phases, configurable key/value sizes.
 
 ## Licence
 
